@@ -12,7 +12,7 @@ The goal of this project is to create a deep learning-based, GAN-style adversari
 
 Additionally, this pipeline is designed and intended to support full modularity, with users able to swap in different models and agents for both the adversary and defender. If time permits, the pipeline may be modified to allow for Reinforcement Learning style policy updates and feedback for the adversary and defender to work off of; however, this is a stretch goal, not a guarentee.
 
-This project uses [EMBER2024](https://github.com/FutureComputing4AI/EMBER2024) for it's dataset, specifically the PE binary version of the dataset. The dataset for this project is NOT within the repository itself, and must be downlaoded independently of this repository as of 13 April, 2026. I intend to have this done automatically when running the setup script later down the line.
+This project uses [EMBER2024](https://github.com/FutureComputing4AI/EMBER2024) for it's dataset, specifically the PE binary version of the dataset. The dataset for this project is NOT within the repository itself (in the interest of repository size), and must be downlaoded independently of this repository as of 13 April, 2026. I intend to have this done automatically when running the setup script later down the line.
 
 Currently, plans for pipeline informatoin flow can be found in the Artifacts folder, along with any other non-code documents can be found. Additionally, the configuration file has been setup, and the beginnings of input digestion have been completed. Further development of the classes and scripts for defender and adversary creation from hyperparameter selection needs implementation, as well as testing and tuning suggested/default hyperparameters.
 
