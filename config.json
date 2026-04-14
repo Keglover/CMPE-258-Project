@@ -1,0 +1,48 @@
+{
+  "_comment": "Adversarial Co-Training Pipeline — Hyperparameters",
+
+  "agent_models": {
+    "defender": "malconv",
+    "evader":   "byte_appender"
+  },
+
+  "data": {
+    "input_size_mb":  2.0,
+    "split_train":    0.70,
+    "split_val":      0.15,
+    "split_test":     0.15,
+    "batch_size":     32
+  },
+
+  "training": {
+    "epochs":            10,
+    "warm_start_len":     5,
+    "num_cotrain_rounds": 10,
+    "update_freq":        1
+  },
+
+  "defender_optimizer": {
+    "lr":             1e-4,
+    "optim":          "adam",
+    "weight_reg":     1e-4,
+    "grad_clip":      1.0
+  },
+
+  "evader_optimizer": {
+    "lr":             1e-4,
+    "optim":          "adam",
+    "weight_reg":     null,
+    "grad_clip":      1.0
+  },
+
+  "adversarial": {
+    "perturb_budget": 512,
+    "perturb_mode":   "append"
+  },
+
+  "evaluation": {
+    "ASR_WL_thresh":     0.50,
+    "eval_freq":          1,
+    "checkpoint_metric": "robust_accuracy"
+  }
+}
