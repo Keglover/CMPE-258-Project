@@ -19,4 +19,11 @@ Currently, plans for pipeline informatoin flow can be found in the Artifacts fol
 
 # Setup and Requirements
 
-A setup script will be necessary to make sure that every dependency is handled correctly and the code is able to be run independent of the host architecture. THIS IS NOT CURRENTLY IMPLEMENTED
+This repository provides a script (setup.py) in the base directory to automate downloading the EMBER2024 dataset, which is not present by default in this repository. **HOWEVER** It is highly recommended that the huggingface command line interface be downloaded and used before-hand in order to speed up the setup process - otherwise, the download will be massively rate limited.
+
+## BEFORE you run setup:
+
+Install the huggingface CLI, using the command ```curl -LsSf https://hf.co/cli/install.sh | bash``` on bash or terminal in MacOS/Linux.
+Then, download the python module using ```pip install -U "huggingface_hub[cli]"```
+Lastly, you will need a read-only token from your huggingface account to login thorugh the command-line. If you DO have an account or token, you can safely skip this step and go to the next pre-setup step. If you don't, go to [huggingface](https://huggingface.co/login) to create a huggingface account. After creating your account, go to your profile's settings page and go to access keys and create a read access key.
+With your copied token, use the command ```hf auth login --token <YOUR_TOKEN>```. After this, you can freely run setup.py without being rate limited on downloading EMBER2024, significantly improving the download speed.
