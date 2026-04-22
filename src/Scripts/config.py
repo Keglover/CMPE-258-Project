@@ -31,12 +31,12 @@ class AgentModelsConfig:
     def validate(self) -> None:
         if self.defender not in self._VALID_DEFENDERS:
             raise ValueError(
-                f"Unknown defender model '{self.defender}'. "
+                f"Unknown or invalid defender model '{self.defender}'. "
                 f"Valid options: {self._VALID_DEFENDERS}"
             )
         if self.evader not in self._VALID_EVADERS:
             raise ValueError(
-                f"Unknown evader model '{self.evader}'. "
+                f"Unknown or invalid evadsive model \'{self.evader}\'. "
                 f"Valid options: {self._VALID_EVADERS}"
             )
 
