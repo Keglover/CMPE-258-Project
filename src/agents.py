@@ -1,3 +1,13 @@
+"""
+    After some consideration, I may not need this file for the project. The reason being
+    that, given the research-like nature of the project, experimenting with the training
+    loop to better model adversarial environments, it would not make sense to create my
+    own models, but rather use existing frameworks, putting them through the experimental
+    training, and evaluating them against their traditionally trained counterparts. I may
+    still need to make an adversary, but I do not need one for the defender.
+"""
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -312,13 +322,6 @@ class Adversary(nn.Module):
             padding_idx=256,
         )
 
-        self.pooling = nn.MaxPool1d(
-            in_channels=embed_dim,
-            out_channels="",
-            kernel_size=kernel_size,
-            stride=kernel_size
-        )
-
         # Gated convolution: value and gate branches share the same config.
         # Input channels = embed_dim; Conv1d expects (batch, channels, length).
         self.conv_value = nn.Conv1d(
@@ -328,6 +331,7 @@ class Adversary(nn.Module):
             stride=kernel_size,  # Non-overlapping windows, matching MalConv.
             bias=True,
         )
+
         self.conv_gate = nn.Conv1d(
             in_channels=embed_dim,
             out_channels=num_filters,
@@ -374,37 +378,31 @@ class Adversary(nn.Module):
     # Forward pass
     # ------------------------------------------------------------------
 
+    #TODO: Not using byte-valid perturbations. Find out how to do this.
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass over a batch of raw byte sequences.
+        Generates adversarial perturbations in embedding space.
+        Note that this currently is NOT a byte-valid perturbation
 
         Args:
-            x: Integer tensor of shape (batch_size, sequence_length),
-               values in [0, 256] where 256 is the padding token.
+            x: Integer byte sequence, shape (batch_size, seq_len)
 
         Returns:
-            Logits tensor of shape (batch_size,). Pass through sigmoid
-            for probabilities; use directly with BCEWithLogitsLoss.
+            Perturbed embedding, shape (batch_size, embed_dim, seq_len)
+            — ready to pass directly into defender's post-embedding layers.
         """
-        # (batch, seq_len) → (batch, seq_len, embed_dim)
-        x = self.embedding(x)
+        # Embed the input into continuous space, same as defender.
+        embedded = self.embedding(x)           # (batch, seq_len, embed_dim)
+        embedded = embedded.transpose(1, 2)    # (batch, embed_dim, seq_len)
 
-        # Conv1d expects (batch, channels, length).
-        x = x.transpose(1, 2)  # → (batch, embed_dim, seq_len)
+        # Generate a perturbation delta of the same shape.
+        delta = self.perturbation_network(embedded)
 
-        # Gated activation: value * sigmoid(gate)
-        value = self.conv_value(x)           # (batch, num_filters, windows)
-        gate  = torch.sigmoid(self.conv_gate(x))
-        x = value * gate                     # (batch, num_filters, windows)
+        # Bound the perturbation within [-ε, ε] via tanh scaling.
+        # This replaces a hard clamp, which has zero gradient at the boundaries.
+        delta = self.epsilon * torch.tanh(delta)
 
-        # Global temporal max pool → (batch, num_filters)
-        x, _ = torch.max(x, dim=2)
-
-        # Classifier head
-        x = F.relu(self.fc1(x))              # (batch, fc_hidden_dim)
-        x = self.fc2(x)                      # (batch, 1)
-
-        return x.squeeze(1)                  # (batch,)
+        return embedded + delta
 
     # ------------------------------------------------------------------
     # Training
@@ -429,12 +427,10 @@ class Adversary(nn.Module):
         self.train()
         self.optimizer.zero_grad()
 
-        '''
-        # Need to generate perturbations here
-        '''
+        evasive_perturbation = self.forward(x)
 
-        defender_logits = defender.forward(x)
-        loss_negated = -1*defender.loss_fn(defender_logits, labels)   # We want to maximize loss, not minimize it
+        defender_logits = defender.forward(evasive_perturbation)
+        loss_negated = -loss_fn(defender_logits, labels)   # We want to maximize loss, not minimize it. No label change either
         loss_negated.backward()
 
         # Gradient clipping guards against instability during co-training,
@@ -450,7 +446,7 @@ class Adversary(nn.Module):
     # Evaluation
     # ------------------------------------------------------------------
 
-    # Currently using defender evaluate() method - MUST MODIFY FOR ATTACKER
+    # TODO: Currently using defender evaluate() method - MUST MODIFY FOR ATTACKER
     @torch.no_grad()
     def evaluate(self, x: torch.Tensor, labels: torch.Tensor, loss_fn: nn.Module) -> dict:
         """
