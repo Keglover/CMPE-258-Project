@@ -447,6 +447,7 @@ class Adversary(nn.Module):
     # ------------------------------------------------------------------
 
     # TODO: Currently using defender evaluate() method - MUST MODIFY FOR ATTACKER
+    # ASR = (# of successful attacks / # of attempted attacks) --> will need to track # of attacks some how, but easy to track # successful attacks after
     @torch.no_grad()
     def evaluate(self, x: torch.Tensor, labels: torch.Tensor, loss_fn: nn.Module) -> dict:
         """
