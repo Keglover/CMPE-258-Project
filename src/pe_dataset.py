@@ -216,3 +216,14 @@ def build_dataset_from_dir(
         max_bytes=max_bytes,
         transform=transform,
     )
+
+def split(dataset: PEBinaryDataset, test_split=0.3, rand_state=42):
+    from sklearn.model_selection import train_test_split
+
+    data_labels = dataset.labels
+
+    train_paths, test_paths, train_labels, test_labels = train_test_split(
+        dataset.file_paths, data_labels, test_size=test_split,
+        random_state=rand_state, stratify=data_labels)
+
+    return train_paths, test_paths, train_labels, test_labels
