@@ -59,7 +59,7 @@ class PEBinaryDataset(Dataset):
         returning.  Receives a 1-D LongTensor of shape (max_bytes,).
     """
 
-    def __init__(self, file_paths: Sequence[str | Path], labels: Sequence[int], max_bytes: int, transform: Optional[Callable[[Tensor], Tensor]] = None):
+    def __init__(self, file_paths: Sequence[str | Path], labels: Sequence[int], max_bytes: int, transform: Optional[Callable[[Tensor], Tensor]] = None) -> None:
         if len(file_paths) != len(labels):
             raise ValueError(
                 f"file_paths ({len(file_paths)}) and labels ({len(labels)}) "
