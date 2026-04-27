@@ -59,7 +59,7 @@ class PEBinaryDataset(Dataset):
         returning.  Receives a 1-D LongTensor of shape (max_bytes,).
     """
 
-    def __init__(self, file_paths: Sequence[str | Path], labels: Sequence[int], max_bytes: int, transform: Optional[Callable[[Tensor], Tensor]] = None) -> None:
+    def __init__(self, file_paths: Sequence[str | Path], labels: Sequence[int], max_bytes: int, transform: Optional[Callable[[Tensor], Tensor]] = None):
         if len(file_paths) != len(labels):
             raise ValueError(
                 f"file_paths ({len(file_paths)}) and labels ({len(labels)}) "
@@ -118,6 +118,29 @@ class PEBinaryDataset(Dataset):
         raw = _read_bytes(path, self.max_bytes)
         return _pad_or_truncate(raw, self.max_bytes)
 
+    def filter_readable_labels(self) -> tuple[list[Path], list[int], list]:
+        import csv
+
+        good_paths, good_labels, bad_files = [], [], []
+
+        for path, label in zip(self.file_paths, self.labels):
+            path = Path(path)
+
+            try:
+                with open(path, 'rb') as fh:
+                    fh.read(1)     # Only need to be able to open the file
+                good_paths.append(path)
+                good_labels.append(label)
+            except OSError as e:
+                bad_files.append(str(path), label, str(e))
+                
+            if len(bad_files) > 0:  # Write bad files to an output log
+                with open("../Data/bad_files.csv", 'w', newline='', encoding='utf8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['path', 'label', 'error'])
+                    writer.writerows(bad_files)
+
+        return good_paths, good_labels, bad_files
 
 # ---------------------------------------------------------------------------
 # Utility functions (module-level so they can be unit-tested independently)
