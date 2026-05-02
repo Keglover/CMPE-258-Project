@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch import optim
 from typing import Optional
 
-
+'''
 class Classifier(nn.Module):
     
     """
@@ -85,14 +85,7 @@ class Classifier(nn.Module):
             embedding_dim=embed_dim,
             padding_idx=256,
         )
-
-        self.pooling = nn.MaxPool1d(
-            in_channels=embed_dim,
-            out_channels="",
-            kernel_size=kernel_size,
-            stride=kernel_size
-        )
-
+        
         # Gated convolution: value and gate branches share the same config.
         # Input channels = embed_dim; Conv1d expects (batch, channels, length).
         self.conv_value = nn.Conv1d(
@@ -144,6 +137,11 @@ class Classifier(nn.Module):
             f"Expected one of: 'Adam', 'AdamW'."
         )
 
+    def zero_grad(self):
+        self.optimizer.zero_grad()
+
+    
+
     # ------------------------------------------------------------------
     # Forward pass
     # ------------------------------------------------------------------
@@ -184,7 +182,7 @@ class Classifier(nn.Module):
     # Training
     # ------------------------------------------------------------------
 
-    def train_step(self, x: torch.Tensor, labels: torch.Tensor, loss_fn: nn.Module) -> float:
+    def train(self, x: torch.Tensor, labels: torch.Tensor, loss_fn: nn.Module) -> float:
         """
         Performs a single supervised training step: forward, loss, backward,
         gradient clip, optimizer step.
@@ -221,7 +219,7 @@ class Classifier(nn.Module):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def evaluate(self, x: torch.Tensor, labels: torch.Tensor, loss_fn: nn.Module) -> dict:
+    def eval(self, x: torch.Tensor, labels: torch.Tensor, loss_fn: nn.Module) -> dict:
         """
         Evaluates the defender on a batch without updating weights.
 
@@ -281,13 +279,14 @@ class Adversary(nn.Module):
     def __init__(        
         self,
         embed_dim: int       = 8,
-        num_filters: int     = 128,
+        vocab_size: int     = 256,
         kernel_size: int     = 512,
         fc_hidden_dim: int   = 128,
         lr: float            = 1e-3,
         optimizer: str       = "Adam",
         weight_decay: float  = 0.0,
-        grad_clip: float     = 1.0
+        grad_clip: float     = 1.0,
+        adv_budget: int     = 256
     ):
 
         super(Adversary, self).__init__()
@@ -296,7 +295,7 @@ class Adversary(nn.Module):
         self.weight_decay = weight_decay
         self.grad_clip   = grad_clip
 
-        self._build_model(embed_dim, num_filters, kernel_size, fc_hidden_dim)
+        self._build_model(embed_dim, vocab_size, kernel_size, fc_hidden_dim, adv_budget)
 
         # Optimizer is constructed after layers exist so parameters are available.
         self.optimizer = self._build_optimizer(optimizer)
@@ -304,7 +303,7 @@ class Adversary(nn.Module):
         # Track current training loss for logging/pipeline access.
         self.last_loss: Optional[float] = None
 
-    def _build_model(self, embed_dim: int, num_filters: int, kernel_size: int, fc_hidden_dim: int) -> None:
+    def _build_model(self, embed_dim: int, vocab_size: int, hidden_dim: int, budget: int=256) -> None:
         """
         Constructs layers following a MalConv-style architecture:
             Embedding → Gated Conv1d → Global Max Pool → FC head
@@ -313,40 +312,22 @@ class Adversary(nn.Module):
         stream; their elementwise product (with sigmoid gate) is the output.
         This is MalConv's mechanism for attending to relevant byte windows.
         """
-        # Byte vocabulary is fixed: 256 possible values (0x00–0xFF), plus
-        # index 256 reserved for the padding token.
-        vocab_size = 257
-        self.embedding = nn.Embedding(
-            num_embeddings=vocab_size,
-            embedding_dim=embed_dim,
-            padding_idx=256,
+        self.adv_len = budget
+        self.byte_emb = nn.Embedding(vocab_size, embed_dim)
+
+        self.conv = nn.Sequential(
+            nn.Conv1d(embed_dim + 1, 64, kernel_size=7, padding=3),
+            nn.ReLU(),
+            nn.Conv1d(64, 128, kernel_size=7, padding=3),
+            nn.ReLU(),
+            nn.AdaptiveMaxPool1d(1)
         )
 
-        # Gated convolution: value and gate branches share the same config.
-        # Input channels = embed_dim; Conv1d expects (batch, channels, length).
-        self.conv_value = nn.Conv1d(
-            in_channels=embed_dim,
-            out_channels=num_filters,
-            kernel_size=kernel_size,
-            stride=kernel_size,  # Non-overlapping windows, matching MalConv.
-            bias=True,
+        self.decoder = nn.Sequential(
+            nn.Linear(128, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, budget * vocab_size)
         )
-
-        self.conv_gate = nn.Conv1d(
-            in_channels=embed_dim,
-            out_channels=num_filters,
-            kernel_size=kernel_size,
-            stride=kernel_size,
-            bias=True,
-        )
-
-        # Global temporal max pool collapses the sequence dimension entirely,
-        # making the model input-length agnostic (critical for variable-size PE).
-        # Implemented in forward() via torch.max rather than a layer.
-
-        # Classifier head: gated conv output → hidden → binary logit.
-        self.fc1 = nn.Linear(num_filters, fc_hidden_dim)
-        self.fc2 = nn.Linear(fc_hidden_dim, 1)  # Single logit for BCEWithLogitsLoss.
 
     def _build_optimizer(self, optimizer_name: str) -> optim.Optimizer:
         """
@@ -377,32 +358,21 @@ class Adversary(nn.Module):
     # ------------------------------------------------------------------
     # Forward pass
     # ------------------------------------------------------------------
+    
+    def forward(self, x_bytes, editable_mask=None):
+        x_emb = self.byte_emb(x_bytes)  # (B, T, E)
 
-    #TODO: Not using byte-valid perturbations. Find out how to do this.
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Generates adversarial perturbations in embedding space.
-        Note that this currently is NOT a byte-valid perturbation
+        if editable_mask is None:
+            editable_mask = torch.zeros_like(x_bytes, dtype=torch.float32)
 
-        Args:
-            x: Integer byte sequence, shape (batch_size, seq_len)
+        mask_feat = editable_mask.unsqueeze(-1)  # (B, T, 1)
+        x = torch.cat([x_emb, mask_feat], dim=-1)  # (B, T, E+1)
+        x = x.transpose(1, 2)  # (B, E+1, T)
 
-        Returns:
-            Perturbed embedding, shape (batch_size, embed_dim, seq_len)
-            — ready to pass directly into defender's post-embedding layers.
-        """
-        # Embed the input into continuous space, same as defender.
-        embedded = self.embedding(x)           # (batch, seq_len, embed_dim)
-        embedded = embedded.transpose(1, 2)    # (batch, embed_dim, seq_len)
+        h = self.conv(x).squeeze(-1)  # (B, 128)
+        logits = self.decoder(h).view(x_bytes.size(0), self.adv_len, 256)
 
-        # Generate a perturbation delta of the same shape.
-        delta = self.perturbation_network(embedded)
-
-        # Bound the perturbation within [-ε, ε] via tanh scaling.
-        # This replaces a hard clamp, which has zero gradient at the boundaries.
-        delta = self.epsilon * torch.tanh(delta)
-
-        return embedded + delta
+        return logits
 
     # ------------------------------------------------------------------
     # Training
@@ -499,3 +469,202 @@ class Adversary(nn.Module):
         self.load_state_dict(checkpoint["model_state"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state"])
         self.last_loss = checkpoint.get("last_loss")
+'''
+
+
+class Defender(nn.Module):
+    def __init__(self, optim_name: str = "Adam", lr=1e-4, weight_decay=0.0, emb_dim=32, hidden_dim=128):
+        super(Defender, self).__init__()
+        self.lr = lr
+        self.weight_decay = weight_decay
+
+        self._build_model(embed_dim=emb_dim, num_filters=128, kernel_size=128, fc_hidden_dim=hidden_dim)
+        self.optim = self._build_optim(optimizer_name=optim_name)
+
+
+    def _build_model(self, embed_dim: int, num_filters: int, kernel_size: int, fc_hidden_dim: int) -> None:
+        """
+        Constructs layers following a MalConv-style architecture:
+            Embedding → Gated Conv1d → Global Max Pool → FC head
+
+        Gating: two parallel convolutions produce a value stream and a gate
+        stream; their elementwise product (with sigmoid gate) is the output.
+        This is MalConv's mechanism for attending to relevant byte windows.
+        """
+        # Byte vocabulary is fixed: 256 possible values (0x00–0xFF), plus
+        # index 256 reserved for the padding token.
+        vocab_size = 257
+        self.embedding = nn.Embedding(
+            num_embeddings=vocab_size,
+            embedding_dim=embed_dim,
+            padding_idx=256,
+        )
+        '''
+        # Don't think I actually need to do this since this is handled implicitly
+        self.pooling = nn.MaxPool1d(
+            in_channels=embed_dim,
+            out_channels="",
+            kernel_size=kernel_size,
+            stride=kernel_size
+        )
+        '''
+        # Gated convolution: value and gate branches share the same config.
+        # Input channels = embed_dim; Conv1d expects (batch, channels, length).
+        self.conv_value = nn.Conv1d(
+            in_channels=embed_dim,
+            out_channels=num_filters,
+            kernel_size=kernel_size,
+            stride=kernel_size,  # Non-overlapping windows, matching MalConv.
+            bias=True,
+        )
+        self.conv_gate = nn.Conv1d(
+            in_channels=embed_dim,
+            out_channels=num_filters,
+            kernel_size=kernel_size,
+            stride=kernel_size,
+            bias=True,
+        )
+
+        # Global temporal max pool collapses the sequence dimension entirely,
+        # making the model input-length agnostic (critical for variable-size PE).
+        # Implemented in forward() via torch.max rather than a layer.
+
+        # Classifier head: gated conv output → hidden → binary logit.
+        self.fc1 = nn.Linear(num_filters, fc_hidden_dim)
+        self.fc2 = nn.Linear(fc_hidden_dim, 1)  # Single logit for BCEWithLogitsLoss.
+
+    def _build_optim(self, optimizer_name):
+        if optimizer_name == "Adam":
+            return optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        else:
+            raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+      
+    def zero_grad(self):
+        self.optim.zero_grad()
+
+    def optimizer_step(self):
+        self.optim.step()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass over a batch of raw byte sequences.
+
+        Args:
+            x: Integer tensor of shape (batch_size, sequence_length),
+               values in [0, 256] where 256 is the padding token.
+
+        Returns:
+            Logits tensor of shape (batch_size,). Pass through sigmoid
+            for probabilities; use directly with BCEWithLogitsLoss.
+        """
+        # (batch, seq_len) → (batch, seq_len, embed_dim)
+        x = self.embedding(x)
+
+        # Conv1d expects (batch, channels, length).
+        x = x.transpose(1, 2)  # → (batch, embed_dim, seq_len)
+
+        # Gated activation: value * sigmoid(gate)
+        value = self.conv_value(x)           # (batch, num_filters, windows)
+        gate  = torch.sigmoid(self.conv_gate(x))
+        x = value * gate                     # (batch, num_filters, windows)
+
+        # Global temporal max pool → (batch, num_filters)
+        x, _ = torch.max(x, dim=2)
+
+        # Classifier head
+        x = F.relu(self.fc1(x))              # (batch, fc_hidden_dim)
+        x = self.fc2(x)                      # (batch, 1)
+
+        return x.squeeze(1)                  # (batch,)
+
+    def criterion(self, logits, labels):
+        return nn.functional.cross_entropy(logits, labels)
+
+    @torch.no_grad()
+    def eval(self, x: torch.Tensor, labels: torch.Tensor, loss_fn: nn.Module) -> dict:
+        """
+        Evaluates the defender on a batch without updating weights.
+
+        Args:
+            x:        Byte sequence batch, shape (batch_size, seq_len).
+            labels:   Binary labels, shape (batch_size,), dtype float.
+            loss_fn:  Loss function; expected BCEWithLogitsLoss.
+
+        Returns:
+            Dict with keys: "loss", "accuracy", "tp", "fp", "tn", "fn".
+        """
+        self.eval()
+
+        logits = self.forward(x)
+        loss = loss_fn(logits, labels)
+
+        preds = (torch.sigmoid(logits) >= 0.5).float()
+
+        tp = ((preds == 1) & (labels == 1)).sum().item()
+        tn = ((preds == 0) & (labels == 0)).sum().item()
+        fp = ((preds == 1) & (labels == 0)).sum().item()
+        fn = ((preds == 0) & (labels == 1)).sum().item()
+
+        total    = labels.numel()
+        accuracy = (tp + tn) / total if total > 0 else 0.0
+
+        return {"loss": loss.item(), "accuracy": accuracy, "tp": tp, "tn": tn, "fp": fp, "fn": fn}
+
+    @torch.no_grad()
+    def predict(self, x: torch.Tensor) -> torch.Tensor:
+        self.eval()
+        return torch.Sigmoid(self.forward(x))
+
+class CNNAttacker(nn.Module):
+    def __init__(self, optim_name: str ="Adam", lr=1e-4, weight_decay=0.0, vocab_size=257, emb_dim=8, hidden_dim=128, adv_len=256):
+        super().__init__()
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.adv_len = adv_len
+        self.byte_emb = nn.Embedding(vocab_size, emb_dim)
+
+        self.conv = nn.Sequential(
+            nn.Conv1d(emb_dim + 1, 64, kernel_size=7, padding=3),
+            nn.ReLU(),
+            nn.Conv1d(64, 128, kernel_size=7, padding=3),
+            nn.ReLU(),
+            nn.AdaptiveMaxPool1d(1)
+        )
+
+        self.decoder = nn.Sequential(
+            nn.Linear(128, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, adv_len * vocab_size)
+        )
+
+        self.optim = self._bulid_optim(optim_name)
+
+    def _bulid_optim(self, optimizer_name):
+        if optimizer_name == "Adam":
+            return optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        
+    '''
+    def eval(self):
+        pass
+    '''
+    
+    def optimizer_step(self):
+        self.optim.step()
+
+    def zero_grad(self):
+        self.optim.zero_grad()
+
+    def forward(self, x_bytes, editable_mask=None):
+        x_emb = self.byte_emb(x_bytes)  # (B, T, E)
+
+        if editable_mask is None:
+            editable_mask = torch.zeros_like(x_bytes, dtype=torch.float32)
+
+        mask_feat = editable_mask.unsqueeze(-1)  # (B, T, 1)
+        x = torch.cat([x_emb, mask_feat], dim=-1)  # (B, T, E+1)
+        x = x.transpose(1, 2)  # (B, E+1, T)
+
+        h = self.conv(x).squeeze(-1)  # (B, 128)
+        logits = self.decoder(h).view(x_bytes.size(0), self.adv_len, 256)
+
+        return logits
