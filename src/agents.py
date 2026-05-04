@@ -1,18 +1,11 @@
-"""
-    After some consideration, I may not need this file for the project. The reason being
-    that, given the research-like nature of the project, experimenting with the training
-    loop to better model adversarial environments, it would not make sense to create my
-    own models, but rather use existing frameworks, putting them through the experimental
-    training, and evaluating them against their traditionally trained counterparts. I may
-    still need to make an adversary, but I do not need one for the defender.
-"""
-
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import optim
 from typing import Optional
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MAX_LEN = int(2.048 * 10**6)    # 2 MB max input or output size
 
 '''
 class Classifier(nn.Module):
@@ -541,7 +534,7 @@ class Defender(nn.Module):
 
     def optimizer_step(self):
         self.optim.step()
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass over a batch of raw byte sequences.
@@ -554,6 +547,12 @@ class Defender(nn.Module):
             Logits tensor of shape (batch_size,). Pass through sigmoid
             for probabilities; use directly with BCEWithLogitsLoss.
         """
+        if x.dtype is not torch.long:
+            x = x.long()
+
+        if x.device is not DEVICE:
+            x = x.to(DEVICE)
+
         # (batch, seq_len) → (batch, seq_len, embed_dim)
         x = self.embedding(x)
 
@@ -591,9 +590,15 @@ class Defender(nn.Module):
         """
         self.eval()
 
-        DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        x = x.to(DEVICE).long()
-        labels = labels.to(DEVICE).float().view(-1)
+        if x.dtype is not torch.long:
+            x = x.long()
+        if x.device is not DEVICE:
+            x = x.to(DEVICE)
+
+        if labels.dtype is not torch.float:
+            labels = labels.float().view(-1)
+        if labels.device is not DEVICE:
+            labels = labels.to(DEVICE)
 
         self.optim.zero_grad()
 
@@ -615,11 +620,7 @@ class Defender(nn.Module):
             accuracy = (tp + tn) / total if total > 0 else 0.0
 
         return {"total": total, "loss": loss.item(), "accuracy": accuracy, "tp": tp, "tn": tn, "fp": fp, "fn": fn}
-
-    @torch.no_grad()
-    def predict(self, x: torch.Tensor) -> torch.Tensor:
-        self.eval()
-        return torch.Sigmoid(self.forward(x))
+    
 
 class CNNAttacker(nn.Module):
     def __init__(self, optim_name: str ="Adam", lr=1e-4, weight_decay=0.0, vocab_size=257, emb_dim=8, hidden_dim=128, adv_len=256, output_vocab_size=256):
@@ -641,10 +642,36 @@ class CNNAttacker(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(128, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, adv_len * vocab_size)
+            nn.Linear(hidden_dim, adv_len * output_vocab_size)
         )
 
         self.optim = self._bulid_optim(optim_name)
+
+    @torch.no_grad()
+    def _apply_adv_bytes(self, x_mal, adv_bytes, editable_mask) -> torch.Tensor:
+        """
+        x_mal:      (B, T)
+        adv_logits: (B, L_adv, 256)
+
+        Returns:
+            x_adv: (B, T + L_adv) or padded/truncated to defender input length
+        """
+        
+        x_adv = torch.cat([x_mal, adv_bytes], dim=1)    # (B, L_adv)
+
+        # Optional: truncate/pad if defender expects fixed length
+        if x_adv.size(1) > MAX_LEN:
+            x_adv = x_adv[:, : MAX_LEN]
+        elif x_adv.size(1) < MAX_LEN:
+            pad_len = MAX_LEN - x_adv.size(1)
+            pad = torch.full(
+                (x_adv.size(0), pad_len), 256,
+                dtype=x_adv.dtype,
+                device=DEVICE
+            )
+            x_adv = torch.cat([x_adv, pad], dim=1)
+
+        return x_adv.long()
 
     def _bulid_optim(self, optimizer_name):
         if optimizer_name == "Adam":
@@ -658,20 +685,76 @@ class CNNAttacker(nn.Module):
     def zero_grad(self):
         self.optim.zero_grad()
 
-    def forward(self, x_bytes, editable_mask=None):
-        x_emb = self.byte_emb(x_bytes)  # (B, T, E)
+    def forward(self, x_bytes, editable_mask=None) -> torch.Tensor:
+        x_bytes = x_bytes.to(DEVICE).long()
+
+        x_emb = self.byte_emb(x_bytes)  # (B, T, emb_dim)
 
         if editable_mask is None:
-            editable_mask = torch.zeros_like(x_bytes, dtype=torch.float32)
+            editable_mask = torch.zeros_like(x_bytes.shape, 
+                                             device=x_bytes.device,
+                                             dtype=torch.float32)
 
-        mask_feat = editable_mask.unsqueeze(-1)  # (B, T, 1)
-        x = torch.cat([x_emb, mask_feat], dim=-1)  # (B, T, E+1)
-        x = x.transpose(1, 2)  # (B, E+1, T)
+        mask_feat = editable_mask.unsqueeze(-1)     # (B, T, 1)
 
-        h = self.conv(x).squeeze(-1)  # (B, 128)
-        logits = self.decoder(h).view(x_bytes.size(0), self.adv_len, self.output_size)
+        x = torch.cat([x_emb, mask_feat], dim=-1)   # (B, T, emb_dim+1)
+        x = x.transpose(1, 2)                       # (B, emb_dim+1, T)
+
+        h = self.conv(x).squeeze(-1)                # (B, 128)
+        logits = self.decoder(h)                    # (B, adv_len * 256)
+        logits = logits.view(
+            x_bytes.size(0), 
+            self.adv_len, 
+            self.output_size
+        )
 
         return logits
     
-    def batch_eval(self, x: torch.Tensor, labels: torch.Tensor, loss_func: nn.Module) -> dict:
-        pass
+    def batch_eval(self, x_mal: torch.Tensor, edit_mask: torch.Tensor, defender: Defender, loss_func=None) -> dict:
+        self.eval()
+        defender.eval()
+
+        if x_mal.dtype is not torch.long:
+            x_mal = x_mal.long()
+        if x_mal.device is not DEVICE:
+            x_mal = x_mal.to(DEVICE)
+        
+        if loss_func is None:
+            loss_func = nn.BCEWithLogitLoss()
+
+        if edit_mask is not None:
+            if edit_mask.device is not DEVICE:
+                edit_mask = edit_mask.to(DEVICE)
+            if edit_mask.dtype is not torch.float:
+                edit_mask = edit_mask.float()
+
+        self.optim.zero_grad()
+        
+        adv_logits = self.forward(x_mal, edit_mask)
+        dist = torch.distributions.Categorical(logits=adv_logits)
+
+        adv_bytes = dist.sample()
+        log_probs = dist.log_prob(adv_bytes)
+
+        x_adv = self._apply_adv_bytes(x_mal, adv_bytes, edit_mask)
+
+        with torch.no_grad():
+            def_logts = defender(x_adv)
+            mal_probs = torch.sigmoid(def_logts)
+
+            reward = 1.0 - mal_probs
+            esr = (mal_probs < 0.5).float().mean().item()
+
+        sequence_log_prob = log_probs.sum(dim=1)
+        loss = -(reward.detach() * sequence_log_prob).mean()
+
+        loss.backward()
+        self.optim.step()
+
+        return{
+            "loss": loss.item(),
+            "reward": reward.mean().item(),
+            "esr": esr,
+            "mean_defender_malware_prob": mal_probs.mean().item()
+        }
+    
