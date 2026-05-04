@@ -143,7 +143,7 @@ class Defender(nn.Module):
             Dict with keys: "loss", "accuracy", "tp", "fp", "tn", "fn".
         """
 
-        self.eval()
+        self.train()
 
         if x.dtype is not torch.long:
             x = x.long()
@@ -178,7 +178,7 @@ class Defender(nn.Module):
     
     def pred(self, x: torch.Tensor, labels: torch.Tensor, loss_fn: nn.Module) -> dict:
         """
-        Runs batch_eval for running testing batches. Does not update weights.
+        Runs batch_eval for running testing batches. Does not update weights. And needed to remove self.backward()
 
         Args:
             Same as self.batch_eval()
@@ -188,7 +188,31 @@ class Defender(nn.Module):
         """
 
         with torch.no_grad():
-            return self.batch_eval(x, labels, loss_fn)
+            self.eval()
+
+            if x.dtype is not torch.long:
+                x = x.long()
+            if x.device is not DEVICE:
+                x = x.to(DEVICE)
+
+            if labels.dtype is not torch.float:
+                labels = labels.float().view(-1)
+            if labels.device is not DEVICE:
+                labels = labels.to(DEVICE)
+
+            logits = self.forward(x)
+            loss = loss_fn(logits, labels)
+            preds = (torch.sigmoid(logits) >= 0.5).float()
+
+            tp = ((preds == 1) & (labels == 1)).sum().item()
+            tn = ((preds == 0) & (labels == 0)).sum().item()
+            fp = ((preds == 1) & (labels == 0)).sum().item()
+            fn = ((preds == 0) & (labels == 1)).sum().item()
+
+            total    = labels.numel()
+            accuracy = (tp + tn) / total if total > 0 else 0.0
+
+            return {"total": total, "loss": loss.item(), "accuracy": accuracy, "tp": tp, "tn": tn, "fp": fp, "fn": fn}
 
 class CNNAttacker(nn.Module):
     def __init__(self, optim_name: str ="Adam", lr=1e-4, weight_decay=0.0, vocab_size=257, emb_dim=8, hidden_dim=128, adv_len=256, output_vocab_size=256):
@@ -259,7 +283,7 @@ class CNNAttacker(nn.Module):
         x_emb = self.byte_emb(x_bytes)  # (B, T, emb_dim)
 
         if editable_mask is None:
-            editable_mask = torch.zeros_like(x_bytes.shape, 
+            editable_mask = torch.zeros(x_bytes.shape, 
                                              device=x_bytes.device,
                                              dtype=torch.float32)
 
@@ -279,7 +303,7 @@ class CNNAttacker(nn.Module):
         return logits
     
     def batch_eval(self, x_mal: torch.Tensor, edit_mask: torch.Tensor, defender: Defender, loss_func=nn.BCEWithLogitsLoss()) -> dict:
-        self.eval()
+        self.train()
         defender.eval()
 
         if x_mal.dtype is not torch.long:
@@ -315,6 +339,7 @@ class CNNAttacker(nn.Module):
 
         loss.backward()
         self.optim.step()
+        self.eval()
 
         return{
             "loss": loss.item(),
