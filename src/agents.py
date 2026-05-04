@@ -538,9 +538,6 @@ class Defender(nn.Module):
             return optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         else:
             raise ValueError(f"Unsupported optimizer: {optimizer_name}")
-      
-    def zero_grad(self):
-        self.optim.zero_grad()
 
     def optimizer_step(self):
         self.optim.step()
@@ -578,10 +575,9 @@ class Defender(nn.Module):
         return x.squeeze(1)                  # (batch,)
 
     def criterion(self, logits, labels):
-        return nn.functional.cross_entropy(logits, labels)
+        return nn.functional.cross_entropy(logits, labels.float().view(-1))
 
-    @torch.no_grad()
-    def eval(self, x: torch.Tensor, labels: torch.Tensor, loss_fn: nn.Module) -> dict:
+    def batch_eval(self, x: torch.Tensor, labels: torch.Tensor, loss_fn: nn.Module) -> dict:
         """
         Evaluates the defender on a batch without updating weights.
 
@@ -595,20 +591,30 @@ class Defender(nn.Module):
         """
         self.eval()
 
+        DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        x = x.to(DEVICE).long()
+        labels = labels.to(DEVICE).float().view(-1)
+
+        self.optim.zero_grad()
+
         logits = self.forward(x)
         loss = loss_fn(logits, labels)
 
-        preds = (torch.sigmoid(logits) >= 0.5).float()
+        loss.backward()
+        self.optim.step()
 
-        tp = ((preds == 1) & (labels == 1)).sum().item()
-        tn = ((preds == 0) & (labels == 0)).sum().item()
-        fp = ((preds == 1) & (labels == 0)).sum().item()
-        fn = ((preds == 0) & (labels == 1)).sum().item()
+        with torch.no_grad():
+            preds = (torch.sigmoid(logits) >= 0.5).float()
 
-        total    = labels.numel()
-        accuracy = (tp + tn) / total if total > 0 else 0.0
+            tp = ((preds == 1) & (labels == 1)).sum().item()
+            tn = ((preds == 0) & (labels == 0)).sum().item()
+            fp = ((preds == 1) & (labels == 0)).sum().item()
+            fn = ((preds == 0) & (labels == 1)).sum().item()
 
-        return {"loss": loss.item(), "accuracy": accuracy, "tp": tp, "tn": tn, "fp": fp, "fn": fn}
+            total    = labels.numel()
+            accuracy = (tp + tn) / total if total > 0 else 0.0
+
+        return {"total": total, "loss": loss.item(), "accuracy": accuracy, "tp": tp, "tn": tn, "fp": fp, "fn": fn}
 
     @torch.no_grad()
     def predict(self, x: torch.Tensor) -> torch.Tensor:
@@ -616,11 +622,12 @@ class Defender(nn.Module):
         return torch.Sigmoid(self.forward(x))
 
 class CNNAttacker(nn.Module):
-    def __init__(self, optim_name: str ="Adam", lr=1e-4, weight_decay=0.0, vocab_size=257, emb_dim=8, hidden_dim=128, adv_len=256):
+    def __init__(self, optim_name: str ="Adam", lr=1e-4, weight_decay=0.0, vocab_size=257, emb_dim=8, hidden_dim=128, adv_len=256, output_vocab_size=256):
         super().__init__()
         self.lr = lr
         self.weight_decay = weight_decay
         self.adv_len = adv_len
+        self.output_size = output_vocab_size
         self.byte_emb = nn.Embedding(vocab_size, emb_dim)
 
         self.conv = nn.Sequential(
@@ -642,11 +649,8 @@ class CNNAttacker(nn.Module):
     def _bulid_optim(self, optimizer_name):
         if optimizer_name == "Adam":
             return optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        
-    '''
-    def eval(self):
-        pass
-    '''
+        else:
+            raise ValueError(f"The optimizer called {optimizer_name} is not supported.")
     
     def optimizer_step(self):
         self.optim.step()
@@ -665,6 +669,9 @@ class CNNAttacker(nn.Module):
         x = x.transpose(1, 2)  # (B, E+1, T)
 
         h = self.conv(x).squeeze(-1)  # (B, 128)
-        logits = self.decoder(h).view(x_bytes.size(0), self.adv_len, 256)
+        logits = self.decoder(h).view(x_bytes.size(0), self.adv_len, self.output_size)
 
         return logits
+    
+    def batch_eval(self, x: torch.Tensor, labels: torch.Tensor, loss_func: nn.Module) -> dict:
+        pass
