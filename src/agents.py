@@ -240,7 +240,7 @@ class CNNAttacker(nn.Module):
         self.optim = self._bulid_optim(optim_name)
 
     @torch.no_grad()
-    def _apply_adv_bytes(self, x_mal, adv_bytes, editable_mask) -> torch.Tensor:
+    def _apply_adv_bytes(self, x_mal, adv_bytes) -> torch.Tensor:
         """
         x_mal:      (B, T)
         adv_logits: (B, L_adv, 256)
@@ -302,7 +302,7 @@ class CNNAttacker(nn.Module):
 
         return logits
     
-    def batch_eval(self, x_mal: torch.Tensor, edit_mask: torch.Tensor, defender: Defender, loss_func=nn.BCEWithLogitsLoss()) -> dict:
+    def batch_eval(self, x_mal: torch.Tensor, edit_mask: torch.Tensor, defender: Defender) -> dict:
         self.train()
         defender.eval()
 
