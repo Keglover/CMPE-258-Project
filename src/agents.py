@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import optim
 
+from cuda_snapshot import cuda_snapshot
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MAX_LEN = int(2.048 * 10**6)    # 2 MB max input or output size
 
@@ -157,7 +158,9 @@ class Defender(nn.Module):
 
         self.optim.zero_grad()
 
+        cuda_snapshot("DEF BATCH_EVAL: BEFORE")
         logits = self.forward(x)
+        cuda_snapshot("DEF BATCH_EVAL: AFTER")
         loss = loss_fn(logits, labels)
 
         loss.backward()
@@ -200,7 +203,9 @@ class Defender(nn.Module):
             if labels.device is not DEVICE:
                 labels = labels.to(DEVICE)
 
+            cuda_snapshot("DEF PRED: BEFORE")
             logits = self.forward(x)
+            cuda_snapshot("DEF PRED: AFTER")
             loss = loss_fn(logits, labels)
             preds = (torch.sigmoid(logits) >= 0.5).float()
 
@@ -240,7 +245,7 @@ class CNNAttacker(nn.Module):
         self.optim = self._bulid_optim(optim_name)
 
     @torch.no_grad()
-    def _apply_adv_bytes(self, x_mal, adv_bytes) -> torch.Tensor:
+    def _apply_adv_bytes(self, x_mal, adv_bytes, edit_mask=None) -> torch.Tensor:
         """
         x_mal:      (B, T)
         adv_logits: (B, L_adv, 256)
@@ -249,7 +254,9 @@ class CNNAttacker(nn.Module):
             x_adv: (B, T + L_adv) or padded/truncated to defender input length
         """
         
+        cuda_snapshot("APPLY ADV BYTES: Before sampling")
         x_adv = torch.cat([x_mal, adv_bytes], dim=1)    # (B, L_adv)
+        cuda_snapshot("APPLY ADV BYTES: After sampling")
 
         # Optional: truncate/pad if defender expects fixed length
         if x_adv.size(1) > MAX_LEN:
@@ -280,22 +287,50 @@ class CNNAttacker(nn.Module):
     def forward(self, x_bytes, editable_mask=None) -> torch.Tensor:
         x_bytes = x_bytes.to(DEVICE).long()
 
-        x_emb = self.byte_emb(x_bytes)  # (B, T, emb_dim)
+        ATTK_VIEW_LEN = 4096
+        if x_bytes.size(1) > ATTK_VIEW_LEN:
+            head = x_bytes[:, :ATTK_VIEW_LEN // 2]
+            tail = x_bytes[:, -ATTK_VIEW_LEN // 2 :]
+            x_bytes_view = torch.cat([head, tail], dim=1)
+            
+            if editable_mask is not None:
+                head_mask = editable_mask[:, :ATTK_VIEW_LEN // 2]
+                tail_mask = editable_mask[:, -ATTK_VIEW_LEN // 2 :]
+                editable_mask = torch.cat([head_mask, tail_mask], dim=1)
+        else:
+            x_bytes_view = x_bytes
 
         if editable_mask is None:
-            editable_mask = torch.zeros(x_bytes.shape, 
-                                             device=x_bytes.device,
-                                             dtype=torch.float32)
+            editable_mask = torch.zeros(
+                x_bytes_view.shape[0],
+                x_bytes_view.shape[1],
+                device=x_bytes.device,
+                dtype=torch.float32,
+            )
+        else:
+            if editable_mask.shape[1] != x_bytes_view.shape[1]:
+                raise ValueError(
+                    f"editable_mask length {editable_mask.shape[1]} does not match "
+                    f"input view length {x_bytes_view.shape[1]}"
+                )
+            
+            if editable_mask.device != x_bytes.device:
+                editable_mask = editable_mask.to(x_bytes.device)
+            if editable_mask.dtype != torch.float32:
+                editable_mask = editable_mask.float()
 
+        x_emb = self.byte_emb(x_bytes_view)  # (B, T, emb_dim)
         mask_feat = editable_mask.unsqueeze(-1)     # (B, T, 1)
 
+        cuda_snapshot("ADV FORWARD: Before concat")
+        print(f"x_emb.shape: {x_emb.shape}, mask_feat.shape: {mask_feat.shape}")
         x = torch.cat([x_emb, mask_feat], dim=-1)   # (B, T, emb_dim+1)
         x = x.transpose(1, 2)                       # (B, emb_dim+1, T)
-
+        cuda_snapshot("ADV FORWARD: After concat")
         h = self.conv(x).squeeze(-1)                # (B, 128)
         logits = self.decoder(h)                    # (B, adv_len * 256)
         logits = logits.view(
-            x_bytes.size(0), 
+            x_bytes_view.size(0), 
             self.adv_len, 
             self.output_size
         )
@@ -319,7 +354,9 @@ class CNNAttacker(nn.Module):
 
         self.optim.zero_grad()
         
+        cuda_snapshot("ADV BATCH_EVAL: Before forward")
         adv_logits = self.forward(x_mal, edit_mask)
+        cuda_snapshot("ADV BATCH_EVAL: After forward")
         dist = torch.distributions.Categorical(logits=adv_logits)
 
         adv_bytes = dist.sample()
